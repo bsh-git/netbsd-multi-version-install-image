@@ -67,6 +67,48 @@ fullpath () {
     esac
 }
 
+#
+# run dd with bigger buffer size for speed
+# Usage: run_dd input output count skip seek
+#
+run_dd () {
+    local bs _bs input output count skip seek
+    input=$1; shift
+    output=$1; shift
+    count=$1; shift
+    if [ $# -gt 0 ]; then skip=$1; shift; fi
+    if [ $# -gt 0 ]; then seek=$1; shift; fi
+    echo 'run_dd(1)' $input,$output,$count,$skip,$seek,$*
+
+    for bs in $((1024 * 1024 * 8)) $((1024 * 1024)) $((512 * 1024)) 512
+    do
+	_bs=$((bs / 512))
+	if [ $((count % _bs + skip % _bs + seek % _bs)) = 0 ]; then
+	    break
+	fi
+    done
+
+    count=$((count * 512 / bs))
+    skip=$((skip * 512 / bs))
+    seek=$((seek * 512 / bs))
+
+    echo 'run_dd(2)' $input,$output,$count,$skip,$seek,$*
+
+    set -- "$@" if="$input" of="$output"
+    if [ $count -gt 0 ]; then
+	set -- "$@" count=$count
+    fi
+    if [ $skip -gt 0 ]; then
+	set -- "$@" skip=$skip
+    fi
+    if [ $seek -gt 0 ]; then
+	set -- "$@" seek=$seek
+    fi
+
+    dd bs=$bs "$@"
+}
+
+
 if [ $OptDebug = yes ]; then
     TmpDir=./Work$$
 else
@@ -103,6 +145,13 @@ NR==1 { next }
 	NBsize = size
 	exit
     }
+    if ($0 ~ /MBR part 169/) {
+	# no GPT. legacy MBR partitioned image.
+	NBstart = start
+	NBsize = size
+	EFIstart = 0
+	EFIsize = 0
+    }
 }
 END {
     print NBstart, NBsize, EFIstart, EFIsize
@@ -127,10 +176,11 @@ uncompress_and_read () {
 }
 
 
-n=1
+n=0
 for img
 do
-    img=$1; shift
+    n=$((n+1))
+    shift
     set -- $(uncompress_and_read $n $img) ":" "$@"
     uc=$1; shift
     nst=$1; shift
@@ -152,7 +202,8 @@ do
 	EFIsize=$esz
 
 	# copy GPT header, GPT table and EFI partition
-	dd if=$uc of=$TmpDir/image count=$nst
+	#dd if=$uc of=$TmpDir/image count=$nst
+	run_dd $uc $TmpDir/image $nst
 	NBstart=$nst
 	NBstart1=$nst
 	sz=$((nst + nsz))
@@ -162,8 +213,8 @@ do
     fi
 
     eval "NBsize$n=$nsz"
-    dd if=$uc of=$TmpDir/$n.img skip=$nst count=$nsz
-    n=$((n+1))
+    # dd if=$uc of=$TmpDir/$n.img skip=$nst count=$nsz
+    run_dd $uc $TmpDir/$n.img $nsz $nst
 done
 
 echo 'EFI: ' $EFIstart, $EFIsize
@@ -187,20 +238,19 @@ while [ $i -le $n ]; do
     i=$((i+1))
 done
 
-# for each NetBSD partition in reverse order:
-i=$n
-while [ $i -gt 0 ]; do
+# for each NetBSD partition, the first one at the last
+for i in $(seq 2 $n) 1; do
     mount_image_file ffs $TmpDir/$i.img $TmpDir/mnt
     ls $TmpDir/mnt
     
     #   modify /etc/fstab
     eval "guid=\$guid$i"
-    sed "s/NAME=[-0-9a-f]*/NAME=$guid/" < $TmpDir/mnt/etc/fstab > $TmpDir/fstab.NEW
+    sed -e 's/^NAME=[-0-9a-f]*/NAME='"$guid/" -e 's/^ROOT.a/NAME='"$guid/" < $TmpDir/mnt/etc/fstab > $TmpDir/fstab.NEW
     $SUDO mv $TmpDir/fstab.NEW $TmpDir/mnt/etc/fstab
     cat $TmpDir/mnt/etc/fstab
 
     if [ $i = 1 ]; then
-	#  modify from boot.cfg
+	#  modify boot.cfg
 	awk -v menu="$TmpDir/menu.txt" '
 	#banner=Welcome to the NetBSD/amd64 9.99.17 installation image
 	/^banner=Welcome to the NetBSD/ {
@@ -210,9 +260,7 @@ while [ $i -gt 0 ]; do
 	/menu=Drop to/ {while ((getline line < menu) > 0) print line }
 	{ print $0 }' $TmpDir/mnt/boot.cfg > $TmpDir/boot.cfg.NEW
 
-	$SUDO mv $TmpDir/boot.cfg.NEW $TmpDir/mnt/boot.cfg
-	cat $TmpDir/mnt/boot.cfg
-
+	$SUDO cp $TmpDir/boot.cfg.NEW $TmpDir/mnt/boot.cfg
     else
 	# get menus from boot.cfg and modify
 	awk -v menu="$TmpDir/menu.txt" -v partition=$((i + 1)) '
@@ -232,9 +280,8 @@ while [ $i -gt 0 ]; do
     eval "echo \$NBstart$i \$NBsize$i"
 
     eval "st=\$NBstart$i"
-    dd if=$TmpDir/$i.img of=$TmpDir/image seek=$st conv=notrunc
-
-    i=$((i-1))
+    #dd if=$TmpDir/$i.img of=$TmpDir/image seek=$st conv=notrunc
+    run_dd $TmpDir/$i.img $TmpDir/image 0 0 $st conv=notrunc
 done
     
 # copy MBR
@@ -244,14 +291,3 @@ gptcmd $TmpDir/image biosboot -i 2 -c $(fullpath "$TmpDir/mbr")
 gptcmd $TmpDir/image set -a bootme -i 2
 
 gptcmd $TmpDir/image show
-
-
-
-#
-get_netbsd_version_from_bootcfg () {
-    local mountpoint
-    mountpoint="$1"
-
-    sed -e '1s/^banner=.*NetBSD/[^ ]*/ \([^ ]*\) installation image.*$/\1/' -e 2q $mountpoint/boot.cfg
-}
-
