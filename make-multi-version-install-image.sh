@@ -12,10 +12,37 @@
 : ${GPT:=gpt}
 : ${SUDO:=sudo}
 : ${VND:=/dev/vnd0d}
-OptDebug=yes
+
+args=$(getopt do: "$@")
+if [ $? -ne 0 ]; then
+    echo >&2 "Usage: $0 [-d] [-o output] image1 image2 ...";
+    exit 2
+fi
+set -- $args
+while [ $# -ne 0 ]; do
+    case $1 in
+	-d) OptDebug=yes;;
+	-o) Output=$2; shift;;
+	--) shift; break;;
+    esac
+    shift
+done
+
+: ${OptDebug:=no}
+: ${Output:=netbsd-multiver.img}
+
+if [ $OptDebug = yes ]; then
+    DBG=
+    TmpDir=./Work$$
+else
+    DBG=:
+    TmpDir=$TMPDIR/multiverinst$$
+    trap "rm -rf '$TmpDir'" 0 1 2 3 15
+fi
+mkdir -p "$TmpDir/mnt"
 
 
-#XXX temporary
+#XXX
 if ! type "$GPT"; then
     GPT=/u1/w/nb/tnf-current/tools/bin/nbgpt
 fi
@@ -78,7 +105,7 @@ run_dd () {
     count=$1; shift
     if [ $# -gt 0 ]; then skip=$1; shift; fi
     if [ $# -gt 0 ]; then seek=$1; shift; fi
-    echo 'run_dd(1)' $input,$output,$count,$skip,$seek,$*
+    $DBG echo 'run_dd(1)' $input,$output,$count,$skip,$seek,$*
 
     for bs in $((1024 * 1024 * 8)) $((1024 * 1024)) $((512 * 1024)) 512
     do
@@ -92,7 +119,7 @@ run_dd () {
     skip=$((skip * 512 / bs))
     seek=$((seek * 512 / bs))
 
-    echo 'run_dd(2)' $input,$output,$count,$skip,$seek,$*
+    $DBG echo 'run_dd(2)' $input,$output,$count,$skip,$seek,$*
 
     set -- "$@" if="$input" of="$output"
     if [ $count -gt 0 ]; then
@@ -108,14 +135,6 @@ run_dd () {
     dd bs=$bs "$@"
 }
 
-
-if [ $OptDebug = yes ]; then
-    TmpDir=./Work$$
-else
-    TmpDir=$TMPDIR/multiverinst$$
-    trap "rm -rf '$TmpDir'" 0 1 2 3 15
-fi
-mkdir -p "$TmpDir/mnt"
 
 cat - <<'EOF' > $TmpDir/readgpt.awk
 NR==1 { next }
@@ -195,15 +214,15 @@ do
 	exit 1
     fi
 
-    echo $img $uc, $nst $nsz $est $esz
+    $DBG echo $img $uc, $nst $nsz $est $esz
 
     if [ $n = 1 ]; then
 	EFIstart=$est
 	EFIsize=$esz
 
 	# copy GPT header, GPT table and EFI partition
-	#dd if=$uc of=$TmpDir/image count=$nst
-	run_dd $uc $TmpDir/image $nst
+	#dd if=$uc of="$Output" count=$nst
+	run_dd $uc "$Output" $nst
 	NBstart=$nst
 	NBstart1=$nst
 	sz=$((nst + nsz))
@@ -217,23 +236,21 @@ do
     run_dd $uc $TmpDir/$n.img $nsz $nst
 done
 
-echo 'EFI: ' $EFIstart, $EFIsize
+$DBG echo 'EFI: ' $EFIstart, $EFIsize
 
 #modify boot.cfg
 
-ls -l $TmpDir/image
-dd if=/dev/zero count=$((1024 * 1024 / 512)) of=$TmpDir/image seek=$sz
-ls -l $TmpDir/image
+dd if=/dev/zero count=$((1024 * 1024 / 512)) of="$Output" seek=$sz
 # re-create GPT table to add the secondary table and header.
-gptcmd $TmpDir/image destroy
-gptcmd $TmpDir/image create
-gptcmd $TmpDir/image add -b $EFIstart -s $EFIsize -t efi -l "EFI system"
+gptcmd "$Output" destroy
+gptcmd "$Output" create
+gptcmd "$Output" add -b $EFIstart -s $EFIsize -t efi -l "EFI system"
 
 # for each NetBSD partition:
 i=1
 while [ $i -le $n ]; do
-    eval "gptcmd $TmpDir/image add -b \$NBstart$i -s \$NBsize$i -t ffs"
-    guid=$(gptcmd $TmpDir/image show -i$((i+1)) | awk '/^GUID:/ {print $2}')
+    eval "gptcmd "$Output" add -b \$NBstart$i -s \$NBsize$i -t ffs"
+    guid=$(gptcmd "$Output" show -i$((i+1)) | awk '/^GUID:/ {print $2}')
     eval "guid$i=$guid"
     i=$((i+1))
 done
@@ -241,13 +258,13 @@ done
 # for each NetBSD partition, the first one at the last
 for i in $(seq 2 $n) 1; do
     mount_image_file ffs $TmpDir/$i.img $TmpDir/mnt
-    ls $TmpDir/mnt
+    $DBG ls $TmpDir/mnt
     
     #   modify /etc/fstab
     eval "guid=\$guid$i"
     sed -e 's/^NAME=[-0-9a-f]*/NAME='"$guid/" -e 's/^ROOT.a/NAME='"$guid/" < $TmpDir/mnt/etc/fstab > $TmpDir/fstab.NEW
     $SUDO mv $TmpDir/fstab.NEW $TmpDir/mnt/etc/fstab
-    cat $TmpDir/mnt/etc/fstab
+    $DBG cat $TmpDir/mnt/etc/fstab
 
     if [ $i = 1 ]; then
 	#  modify boot.cfg
@@ -277,17 +294,17 @@ for i in $(seq 2 $n) 1; do
 
     umount_image_file $TmpDir/mnt
 
-    eval "echo \$NBstart$i \$NBsize$i"
+    $DBG eval "echo \$NBstart$i \$NBsize$i"
 
     eval "st=\$NBstart$i"
-    #dd if=$TmpDir/$i.img of=$TmpDir/image seek=$st conv=notrunc
-    run_dd $TmpDir/$i.img $TmpDir/image 0 0 $st conv=notrunc
+    #dd if=$TmpDir/$i.img of="$Output" seek=$st conv=notrunc
+    run_dd $TmpDir/$i.img "$Output" 0 0 $st conv=notrunc
 done
     
 # copy MBR
 dd if=$TmpDir/1.srcimg of=$TmpDir/mbr bs=440 count=1
 
-gptcmd $TmpDir/image biosboot -i 2 -c $(fullpath "$TmpDir/mbr")
-gptcmd $TmpDir/image set -a bootme -i 2
+gptcmd "$Output" biosboot -i 2 -c $(fullpath "$TmpDir/mbr")
+gptcmd "$Output" set -a bootme -i 2
 
-gptcmd $TmpDir/image show
+$DBG gptcmd "$Output" show
